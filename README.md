@@ -8,70 +8,15 @@ An autonomous Python agent for **Case Closed**, a Tron-style grid duel where eve
 
 ### Match architecture
 
-Each match is a client–server loop between two agent processes and a central judge:
+Each match is a client–server loop between two agent (this vs competitor) processes and a central judge:
 
-```mermaid
-sequenceDiagram
-    participant J as Judge Engine
-    participant A1 as This Agent (P1)
-    participant A2 as Competitor (P2)
 
-    J->>A1: GET /  (health + identity)
-    J->>A2: GET /
-    loop Every turn (≤500)
-        J->>A1: POST /send-state  (board, trails, boosts, turn)
-        J->>A2: POST /send-state
-        J->>A1: GET /send-move
-        J->>A2: GET /send-move
-        Note over J: Both moves executed simultaneously
-        J->>A1: updated state
-        J->>A2: updated state
-    end
-    J->>A1: POST /end
-    J->>A2: POST /end
-```
+1. **Move request** — The agent must respond within **1.5 s** or forfeit the turn (5 random-move fallbacks, then forfeit).
+2. **Simultaneous resolution** — Both moves are applied on an **18 × 20 torus** board. Trails are permanent walls; hitting any trail (including your own) is fatal. Head-on head collisions are a draw.
+3. **Termination** — Game ends on crash, draw, 500 judge turns, or 200 in-game turns (longer trail wins).
 
-1. **State sync** — The judge POSTs a JSON snapshot (`board`, both trails, lengths, alive flags, boosts, `turn_count`) to `/send-state`. The agent mirrors this into a local `Game` object.
-2. **Move request** — The judge GETs `/send-move` with query params (`player_number`, `attempt_number`, `random_moves_left`, `turn_count`). The agent must respond within **1.5 s** or forfeit the turn (5 random-move fallbacks, then forfeit).
-3. **Simultaneous resolution** — Both moves are applied on an **18 × 20 torus** board. Trails are permanent walls; hitting any trail (including your own) is fatal. Head-on head collisions are a draw.
-4. **Termination** — Game ends on crash, draw, 500 judge turns, or 200 in-game turns (longer trail wins).
 
-### Per-move decision pipeline
-
-On every `/send-move` call, `agent.py` runs the following pipeline:
-
-```
-Receive state
-    → Infer opponent behavior (serpentine / aggressive / unknown)
-    → Select phase weights (opening / midgame / endgame)
-    → Generate safe candidates (4 directions × optional BOOST)
-    → Score each candidate (Voronoi + safety heuristics)
-    → Refine top-K with depth-2 beam search
-    → Refine further with Monte Carlo rollouts
-    → Return highest-scoring move
-```
-
-The core objective is **territorial control**: pick the move that maximizes our reachable space relative to the opponent's, while avoiding self-traps and imminent collisions.
-
----
-
-## Technology
-
-| Layer | Choice | Role |
-|-------|--------|------|
-| Language | Python 3.12 | Agent logic and server |
-| Web framework | Flask | HTTP API (`/`, `/send-state`, `/send-move`, `/end`) |
-| HTTP client | `requests` | Used by judge engine and local tester |
-| Concurrency | `threading.Lock` | Thread-safe state between endpoints |
-| Data structures | `collections.deque`, plain lists | Trail storage, BFS queues |
-| Container | Docker (`python:3.12-slim`) | Submission packaging |
-| Game rules | `case_closed_game.py` | Source-of-truth simulation |
-
-No ML frameworks are required. The agent is **pure heuristic search** (BFS, beam search, lightweight Monte Carlo), keeping latency low and the Docker image small.
-
----
-
-## Strategy
+## Our Strategy
 
 ### 1. Voronoi territorial scoring
 
@@ -188,7 +133,6 @@ Then re-run `local-tester.py` against the container.
 
 ---
 
-## Mathematical Foundations
 
 ### Torus (wraparound) geometry
 
@@ -254,18 +198,14 @@ An **articulation point** (cut vertex) in graph theory is a vertex whose removal
 
 | Topic | Reference |
 |-------|-----------|
-| **Tron / Light Cycles** | Classic arcade game (1982); two-player territory enclosure on a grid — direct inspiration for Case Closed |
 | **Hamiltonian cycle strategies** | Applegate et al., *The Traveling Salesman Problem* (1998) — Hamiltonian paths underpin serpentine full-board coverage strategies common in Tron AI |
 | **Voronoi / territory evaluation** | Berlekamp, Conway & Guy, *Winning Ways for Your Mathematical Plays* (1982) — territorial decomposition in combinatorial games |
 | **Go liberties & life-and-death** | Benson's algorithm for unconditional life (1976); liberty counting as mobility heuristic |
-| **Graph search** | Cormen et al., *Introduction to Algorithms* — BFS for shortest paths, connected components |
 | **Articulation points** | Tarjan (1972), depth-first search for biconnected components |
 | **Monte Carlo rollouts** | Browne et al., "A Survey of Monte Carlo Tree Search Methods" (2012) — rollout-based policy evaluation (we use a lightweight 3-step variant, not full MCTS) |
 | **Multi-agent grid games** | Surakarta / Tron bot competitions — Voronoi and flood-fill heuristics are standard baselines when full game-tree search is intractable (\(O(b^d)\) with \(b \approx 4\), \(d \leq 500\)) |
 
 ---
-
-## SWOT Analysis
 
 ### Strengths
 - **Principled territory model** — Voronoi scoring directly optimizes space advantage, aligned with win condition (survive + outlast).
