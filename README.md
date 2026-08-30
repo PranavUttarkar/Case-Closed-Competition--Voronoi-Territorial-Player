@@ -1,4 +1,4 @@
-# Case Closed — Voronoi Territorial Agent · 3rd / 303 @ TAMU Datathon
+# Case Closed Competition — Voronoi Territorial Player · Placed 3rd @ TAMU Datathon (303 participants)
 
 An autonomous Python agent for **Case Closed**, a Tron-style grid duel where every move leaves a permanent trail. This repository ships a production-ready Flask server (`agent.py`) that plays head-to-head matches via the official Judge Engine API.
 
