@@ -13,8 +13,8 @@ Each match is a client–server loop between two agent processes and a central j
 ```mermaid
 sequenceDiagram
     participant J as Judge Engine
-    participant A1 as This Agent (P1 :5008)
-    participant A2 as competitor (P2 :5009)
+    participant A1 as This Agent (P1)
+    participant A2 as Competitor (P2)
 
     J->>A1: GET /  (health + identity)
     J->>A2: GET /
