@@ -1,3 +1,296 @@
+# Case Closed — Voronoi Territorial Agent · 3rd / 303 @ TAMU Datathon
+
+An autonomous Python agent for **Case Closed**, a Tron-style grid duel where every move leaves a permanent trail. This repository ships a production-ready Flask server (`agent.py`) that plays head-to-head matches via the official Judge Engine API.
+
+---
+
+## How It Works
+
+### Match architecture
+
+Each match is a client–server loop between two agent processes and a central judge:
+
+```mermaid
+sequenceDiagram
+    participant J as Judge Engine
+    participant A1 as agent.py (P1 :5008)
+    participant A2 as sample_agent.py (P2 :5009)
+
+    J->>A1: GET /  (health + identity)
+    J->>A2: GET /
+    loop Every turn (≤500)
+        J->>A1: POST /send-state  (board, trails, boosts, turn)
+        J->>A2: POST /send-state
+        J->>A1: GET /send-move
+        J->>A2: GET /send-move
+        Note over J: Both moves executed simultaneously
+        J->>A1: updated state
+        J->>A2: updated state
+    end
+    J->>A1: POST /end
+    J->>A2: POST /end
+```
+
+1. **State sync** — The judge POSTs a JSON snapshot (`board`, both trails, lengths, alive flags, boosts, `turn_count`) to `/send-state`. The agent mirrors this into a local `Game` object.
+2. **Move request** — The judge GETs `/send-move` with query params (`player_number`, `attempt_number`, `random_moves_left`, `turn_count`). The agent must respond within **1.5 s** or forfeit the turn (5 random-move fallbacks, then forfeit).
+3. **Simultaneous resolution** — Both moves are applied on an **18 × 20 torus** board. Trails are permanent walls; hitting any trail (including your own) is fatal. Head-on head collisions are a draw.
+4. **Termination** — Game ends on crash, draw, 500 judge turns, or 200 in-game turns (longer trail wins).
+
+### Per-move decision pipeline
+
+On every `/send-move` call, `agent.py` runs the following pipeline:
+
+```
+Receive state
+    → Infer opponent behavior (serpentine / aggressive / unknown)
+    → Select phase weights (opening / midgame / endgame)
+    → Generate safe candidates (4 directions × optional BOOST)
+    → Score each candidate (Voronoi + safety heuristics)
+    → Refine top-K with depth-2 beam search
+    → Refine further with Monte Carlo rollouts
+    → Return highest-scoring move
+```
+
+The core objective is **territorial control**: pick the move that maximizes our reachable space relative to the opponent's, while avoiding self-traps and imminent collisions.
+
+---
+
+## Technology
+
+| Layer | Choice | Role |
+|-------|--------|------|
+| Language | Python 3.12 | Agent logic and server |
+| Web framework | Flask | HTTP API (`/`, `/send-state`, `/send-move`, `/end`) |
+| HTTP client | `requests` | Used by judge engine and local tester |
+| Concurrency | `threading.Lock` | Thread-safe state between endpoints |
+| Data structures | `collections.deque`, plain lists | Trail storage, BFS queues |
+| Container | Docker (`python:3.12-slim`) | Submission packaging |
+| Game rules | `case_closed_game.py` | Source-of-truth simulation |
+
+No ML frameworks are required. The agent is **pure heuristic search** (BFS, beam search, lightweight Monte Carlo), keeping latency low and the Docker image small.
+
+---
+
+## Strategy
+
+### 1. Voronoi territorial scoring
+
+For each candidate move, we simulate occupying the path cells and compute BFS distance maps from **our new head** and the **opponent head** on the torus grid. Every empty cell is assigned to whichever agent reaches it first (ties are neutral):
+
+\[
+\text{territory\_score} = w_T \cdot \bigl(|\mathcal{V}_{\text{me}}| - |\mathcal{V}_{\text{opp}}|\bigr)
+\]
+
+where \(\mathcal{V}_{\text{me}}\) and \(\mathcal{V}_{\text{opp}}\) are the Voronoi cell sets under graph shortest-path distance.
+
+### 2. Local safety features (Go-inspired)
+
+| Feature | Meaning |
+|---------|---------|
+| **Liberties** | Count of empty orthogonal neighbors at the landing cell |
+| **Component size** | Size of the connected empty region reachable from our head |
+| **Choke penalty** | Heavy penalty if component shrinks below 25% or 50% of current size |
+| **Dead-pocket penalty** | \(-10{,}000\) if liberties \(= 0\) or component \(\leq 2\) |
+
+### 3. Opponent modeling
+
+The last 12 opponent head positions are tracked. Two modes are inferred:
+
+- **Serpentine** — Dominant horizontal movement with periodic vertical steps (cycle-following opponents).
+- **Aggressive** — Manhattan distance to us is decreasing over recent history.
+
+Weights adapt: higher risk aversion vs. aggressive opponents; slightly higher territorial weight vs. serpentine opponents.
+
+### 4. Phase-dependent weights
+
+Board fill ratio \(\rho = \frac{\text{empty cells}}{H \times W}\) selects opening, midgame, or endgame weight tables:
+
+| Phase | Condition | Emphasis |
+|-------|-----------|----------|
+| Opening | \(\rho > 0.6\) | Territory (\(w_T = 1.0\)) |
+| Midgame | \(0.3 < \rho \leq 0.6\) | Balanced territory + liberties |
+| Endgame | \(\rho \leq 0.3\) | Liberties + component survival (\(w_{\text{lib}} = 0.55\)) |
+
+### 5. Risk and collision avoidance
+
+- Precompute opponent 1-step and 2-step (boost) reachable cells.
+- Penalize landing on or passing through those cells.
+- Penalize close proximity (\(d_{\text{opp}} \leq 2\)) at the landing cell.
+
+### 6. Graph-theoretic extras
+
+- **Articulation heuristic** — Detect whether occupying a cell would split empty space into multiple components (bridge detection); slight bonus when splitting may isolate opponent territory.
+- **Sealing bonus** — Reward moves adjacent to two or more of our own trail cells (loop-enclosure potential).
+
+### 7. Lookahead layers
+
+| Method | Depth | Purpose |
+|--------|-------|---------|
+| **Beam search** | 2 plies (our move → our follow-up) | Avoid greedy one-step traps |
+| **Monte Carlo rollouts** | 3 random safe steps × 6–10 trials | Estimate post-move mobility stability |
+
+Top-3 candidates from the heuristic pass are refined; the final move maximizes the combined score.
+
+### 8. Boost policy
+
+Each agent has **3 boosts** (move twice in one direction). Boost candidates are generated only when both steps are safe. A phase-dependent penalty discourages wasteful boost use in the opening; endgame allows more aggressive spending.
+
+---
+
+## Testing
+
+### API compliance (`local-tester.py`)
+
+Run with `agent.py` already listening on port 5008:
+
+```bash
+python local-tester.py
+```
+
+Checks: `GET /`, `POST /send-state`, `GET /send-move` (including `:BOOST` format), `POST /end`.
+
+### Head-to-head simulation
+
+Terminal 1 — your agent (port 5008):
+
+```bash
+python agent.py
+```
+
+Terminal 2 — baseline opponent (port 5009):
+
+```bash
+python sample_agent.py
+```
+
+Terminal 3 — judge:
+
+```bash
+python judge_engine.py
+```
+
+`sample_agent.py` implements a **simpler Voronoi baseline** (single-pass scoring, no opponent modeling, beam search, or rollouts). Matches against it validate that the full agent outperforms the baseline under the same rules.
+
+### Docker smoke test
+
+```bash
+docker build -t case-closed-agent .
+docker run -p 5008:5008 case-closed-agent
+```
+
+Then re-run `local-tester.py` against the container.
+
+### Operational constraints tested against
+
+- **1.5 s move timeout** per judge request (two retries, then random fallback).
+- **No 180° reversals** — invalid opposite-direction moves are rejected by the judge.
+- **Torus wrap-around** — all coordinate math uses modular arithmetic.
+
+---
+
+## Mathematical Foundations
+
+### Torus (wraparound) geometry
+
+The board is a flat torus \(T^2 = \mathbb{Z}_W \times \mathbb{Z}_H\). Position normalization:
+
+\[
+x' = x \bmod W, \quad y' = y \bmod H
+\]
+
+**Torus Manhattan distance** between cells \((x_1,y_1)\) and \((x_2,y_2)\):
+
+\[
+d_{\text{torus}}(p_1, p_2) = \min(|x_1 - x_2|, W - |x_1 - x_2|) + \min(|y_1 - y_2|, H - |y_1 - y_2|)
+\]
+
+BFS on the 4-connected grid with torus edges produces the **graph shortest-path metric** used for Voronoi partitioning (not Euclidean Voronoi).
+
+### BFS distance map
+
+Given occupied set \(O\) and start cell \(s\), the distance map \(\delta_s : V \to \mathbb{N} \cup \{-1\}\) satisfies:
+
+\[
+\delta_s(v) = \min\{ k \mid \exists \text{ path of length } k \text{ from } s \text{ to } v \text{ through cells in } V \setminus O \}
+\]
+
+with \(\delta_s(v) = -1\) if unreachable. Computed in \(O(WH)\) per call; opponent distances are cached and recomputed only when our candidate path blocks previously reachable cells.
+
+### Voronoi partition on a grid
+
+For empty cell \(c\):
+
+\[
+c \in \mathcal{V}_{\text{me}} \iff \delta_{\text{me}}(c) < \delta_{\text{opp}}(c) \quad \text{(strict inequality)}
+\]
+
+Ties are ignored (neutral), which avoids over-counting contested frontier cells.
+
+### Full scoring function
+
+For candidate move \(m\) with landing cell \(\ell\):
+
+\[
+S(m) = w_T \Delta\mathcal{V} + w_L \cdot \text{lib}(\ell) + w_C \cdot |C(\ell)| - P_{\text{choke}} - P_{\text{risk}} - P_{\text{boost}} - P_{\text{dead}} + B_{\text{seal}} + B_{\text{straight}}
+\]
+
+where \(\Delta\mathcal{V} = |\mathcal{V}_{\text{me}}| - |\mathcal{V}_{\text{opp}}|\), \(\text{lib}(\ell)\) is liberties, \(|C(\ell)|\) is connected empty component size, and penalty terms encode collision risk, choke detection, and dead-end avoidance.
+
+Beam and rollout refinements add:
+
+\[
+S_{\text{final}}(m) = S(m) + S_{\text{beam}}(m) + 0.05 \cdot \overline{\text{lib}}_{\text{rollout}}(m)
+\]
+
+### Connected components and articulation
+
+The empty cells form a subgraph of the grid graph. **Liberties** count the degree of the landing vertex in that subgraph. **Component size** is the order of the connected component containing the head after the move.
+
+An **articulation point** (cut vertex) in graph theory is a vertex whose removal increases the number of connected components. Our `is_articulation` heuristic approximates this: if occupying \((x,y)\) would disconnect multiple empty neighbor regions, the cell acts as a bridge — valuable for territory sealing.
+
+---
+
+## References & Related Work
+
+| Topic | Reference |
+|-------|-----------|
+| **Tron / Light Cycles** | Classic arcade game (1982); two-player territory enclosure on a grid — direct inspiration for Case Closed |
+| **Hamiltonian cycle strategies** | Applegate et al., *The Traveling Salesman Problem* (1998) — Hamiltonian paths underpin serpentine full-board coverage strategies common in Tron AI |
+| **Voronoi / territory evaluation** | Berlekamp, Conway & Guy, *Winning Ways for Your Mathematical Plays* (1982) — territorial decomposition in combinatorial games |
+| **Go liberties & life-and-death** | Benson's algorithm for unconditional life (1976); liberty counting as mobility heuristic |
+| **Graph search** | Cormen et al., *Introduction to Algorithms* — BFS for shortest paths, connected components |
+| **Articulation points** | Tarjan (1972), depth-first search for biconnected components |
+| **Monte Carlo rollouts** | Browne et al., "A Survey of Monte Carlo Tree Search Methods" (2012) — rollout-based policy evaluation (we use a lightweight 3-step variant, not full MCTS) |
+| **Multi-agent grid games** | Surakarta / Tron bot competitions — Voronoi and flood-fill heuristics are standard baselines when full game-tree search is intractable (\(O(b^d)\) with \(b \approx 4\), \(d \leq 500\)) |
+
+---
+
+## SWOT Analysis
+
+### Strengths
+- **Principled territory model** — Voronoi scoring directly optimizes space advantage, aligned with win condition (survive + outlast).
+- **Multi-layer safety** — Component size, liberties, choke detection, and opponent reachability reduce self-trap deaths.
+- **Adaptive play** — Phase weights and opponent modeling adjust without retraining.
+- **Low latency** — Pure Python heuristics with BFS caching; no GPU or heavy ML dependencies.
+- **Torus-correct** — All distance and neighbor logic respects wrap-around.
+
+### Weaknesses
+- **No full opponent lookahead** — Beam search assumes opponent does not interfere on ply 2; rollouts use random moves, not adversarial ones.
+- **Greedy Voronoi** — One-step territorial gain can miss long-horizon enclosure setups.
+- **Heuristic articulation** — Bridge detection is local, not a full Tarjan pass each move.
+
+### Opportunities
+- Full **minimax / alpha-beta** on Voronoi score for 2–3 plies with opponent modeling.
+- **Opening book** — Precomputed Hamiltonian serpentine for uncontested early game.
+- **Stronger MCTS** — Replace random rollouts with playout policies biased toward territory.
+
+### Threats
+- Opponents designed to **bait into narrow corridors** early.
+- **Timeout forfeit** if BFS + rollouts exceed 1.5 s on congested endgame boards.
+- Adversaries that **break Voronoi assumptions** via unpredictable boosts.
+
+---
+
 # Case Closed Agent Template
 
 ### Explanation of Files
@@ -12,60 +305,6 @@ This template provides a few key files to get you started. Here's what each one 
 *   It has all the required endpoints (`/`, `/send-state`, `/send-move`, `/end`). You do not need to change the structure of these.
 *   Look for the `send_move` function. Inside, you will find a section marked with comments: `# --- YOUR CODE GOES HERE ---`. This is where you should add your code to decide which move to make based on the current game state.
 *   Your agent can return moves in the format `"DIRECTION"` (e.g., `"UP"`, `"DOWN"`, `"LEFT"`, `"RIGHT"`) or `"DIRECTION:BOOST"` (e.g., `"UP:BOOST"`) to use a speed boost.
-
-## Our Agent Strategy (Hamiltonian + Flood-Fill Heuristic)
-
-This repository’s `agent.py` implements a modular, high-coverage strategy that combines a Hamiltonian serpentine cycle with a safety-first heuristic fallback. The goal is to systematically traverse the board and fill as many cells as possible while minimizing crash risk and head-on collisions.
-
-### Key Ideas
-- Hamiltonian serpentine cycle: A precomputed path that visits every cell exactly once in a snaking pattern across rows. If the next cell on this cycle is available and not the opposite of our current direction, we follow it. This tends to maximize coverage and keep our trail orderly.
-- Flood-fill fallback: When the cycle is blocked or following it would be risky, we evaluate the remaining safe directions using a scoring function based on reachable empty area after the move, distance from the opponent’s head, a bonus for continuing straight (to avoid jitter), and a cycle-continuity bonus.
-- Selective boost usage: We only use a BOOST if it safely and clearly increases our score beyond a threshold; otherwise, we conserve boosts.
-
-### Components at a Glance
-- Torus normalization: All coordinates wrap around the edges (`width` and `height`).
-- Direction inference: We infer current direction from the last two trail positions accounting for wrap.
-- Hamiltonian successor map: For each cell, compute its “next” neighbor in a serpentine cycle.
-- Reachable-area estimator: A fast BFS (flood fill) to count empty cells reachable after a candidate move.
-- Scoring: `score = area*10 + distance_to_opponent*2 + straight_bonus + cycle_bonus + boost_penalty`. Deaths are very heavily penalized.
-
-### Pseudocode
-1. Read state, locate our head, compute `current_dir` and the Hamiltonian successor map.
-2. If the next cell on the cycle is free and not opposite to `current_dir`, follow it (no boost by default).
-3. Else, evaluate all non-opposite directions:
-    - Simulate occupying that next cell (and second step if boosting),
-    - If safe, compute reachable area via BFS and distance to opponent head (with torus),
-    - Add small straight and cycle continuity bonuses; penalize boost slightly.
-4. Choose the move with the highest score. Use BOOST only if its score beats the best non-boost by a clear margin.
-
-### Why This Works
-- The cycle provides a low-computation, high-coverage plan when uncontested.
-- The heuristic safely deviates when necessary to avoid traps and preserve future mobility.
-- Conservative boost policy reduces accidental over-commit into tight spaces.
-
-## SWOT Analysis
-
-### Strengths
-- High coverage: Serpentine cycle tends to visit all cells without crossing the trail.
-- Safe fallback: Flood-fill ensures we prefer moves that keep future options open.
-- Torus-aware: Correct handling of wrap-around for direction, distances, and reachability.
-- Modular design: Easy to tune scoring weights and swap components.
-
-### Weaknesses
-- Determinism can be exploited: A strong opponent may learn our cycle-following pattern.
-- Local heuristic: Flood-fill looks only one (or two with boost) steps ahead before area estimation; it’s not a full game tree search.
-- Boost conservatism: May miss rare opportunities where aggressive boosts create winning partitions.
-
-### Opportunities
-- Opponent modeling: Predict opponent head trajectory and penalize risky head-on lines more precisely.
-- Territory partitioning: Intentionally steer to split the board and secure a larger isolated region.
-- Adaptive boost policy: Detect long safe corridors and spend boosts to capitalize.
-- Caching: Memoize repeated flood-fill evaluations for identical local configurations.
-
-### Threats
-- Adversarial agents designed to break cycles early or force narrow corridors.
-- Time constraints: More sophisticated lookahead or RL policies risk timeouts under strict per-move limits.
-- Platform constraints: CPU-only libraries and Docker image limits restrict heavier models.
 
 #### `requirements.txt`
 **This file lists your agent's Python dependencies.**
@@ -91,7 +330,7 @@ This repository’s `agent.py` implements a modular, high-coverage strategy that
 *   Key mechanics:
     - Agents leave permanent trails behind them
     - Hitting any trail (including your own) causes death
-    - Head-on collisions: the agent with the longer trail survives
+    - Head-on collisions: both agents die (draw)
     - Each agent has 3 speed boosts (moves twice instead of once)
     - The board has torus (wraparound) topology
     - Game ends after 500 turns or when one/both agents die
@@ -101,6 +340,7 @@ This repository’s `agent.py` implements a modular, high-coverage strategy that
 
 *   The sample agent is provided to help you evaluate your own agent's performance. 
 *   In conjunction with `judge_engine.py`, you should be able to simulate a match against this agent.
+*   It implements a simplified Voronoi territorial baseline (single-pass scoring without opponent modeling or lookahead).
 
 #### `local-tester.py`
 **A local tester to verify your agent's API compliance.**
