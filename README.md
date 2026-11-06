@@ -1,5 +1,6 @@
 # Case Closed Competition — Voronoi Territorial Player · Placed 3rd @ TAMU Datathon (303 participants)
 DevPost: https://devpost.com/software/spacemaxxer
+---
 An autonomous Python agent for **Case Closed**, a Tron-style grid duel where every move leaves a permanent trail. This repository ships a production-ready Flask server (`agent.py`) that plays head-to-head matches via the official Judge Engine API.
 
 ---
