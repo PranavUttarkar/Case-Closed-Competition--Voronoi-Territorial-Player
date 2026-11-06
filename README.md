@@ -30,8 +30,7 @@ $$
 \text{territory score} = w_T \cdot \bigl(\lvert\mathcal{V}_{\text{me}}\rvert - \lvert\mathcal{V}_{\text{opp}}\rvert\bigr)
 $$
 
-where $\mathcal{V}_{\text{me}}$ and $\mathcal{V}_{\text{opp}}$ are the Voronoi cell sets under graph shortest-path distance.
-
+where $`\mathcal{V}_{\text{me}}`$ and $`\mathcal{V}_{\text{opp}}`$ are the Voronoi cell sets under graph shortest-path distance.
 ### 2. Local safety features (Go-inspired)
 
 | Feature | Meaning |
